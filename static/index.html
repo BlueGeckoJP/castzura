@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html>
+
+<body>
+    <video id="remoteVideo" autoplay playsinline controls style="width: 500px;"></video>
+    <script>
+        const peerConn = new RTCPeerConnection();
+        const ws = new WebSocket(`ws://${location.host}/ws`);
+
+        peerConn.ontrack = (event) => {
+            document.getElementById("remoteVideo").srcObject = event.streams[0];
+        }
+
+        ws.onopen = async () => {
+            peerConn.addTransceiver("video", { direction: "recvonly" });
+            const offer = await peerConn.createOffer();
+            await peerConn.setLocalDescription(offer);
+
+            peerConn.onicecandidate = (event) => {
+                if (event.candidate === null) ws.send(JSON.stringify(peerConn.localDescription));
+            }
+        };
+
+        ws.onmessage = async (event) => {
+            const answer = JSON.parse(event.data);
+            await peerConn.setRemoteDescription(answer);
+        }
+    </script>
+</body>
+
+</html>
