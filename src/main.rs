@@ -1,19 +1,24 @@
 mod ffmpeg_encoder;
 mod pw_source;
 
-use std::sync::Arc;
+use std::{
+    net::{IpAddr, SocketAddr},
+    sync::Arc,
+};
 
 use crate::pw_source::PwSource;
 use axum::{
     Router,
     extract::{
-        MatchedPath, State, WebSocketUpgrade,
+        ConnectInfo, MatchedPath, State, WebSocketUpgrade,
         ws::{Message, WebSocket},
     },
-    http::Request,
+    http::{Request, StatusCode},
+    middleware::{self, Next},
     response::IntoResponse,
     routing::get,
 };
+use clap::Parser;
 use std::time::Instant;
 use tower_http::{services::ServeDir, trace::TraceLayer};
 use tracing::{error, info, info_span};
@@ -31,15 +36,30 @@ use webrtc::{
     track::track_local::{TrackLocalWriter, track_local_static_rtp::TrackLocalStaticRTP},
 };
 
+#[derive(Parser)]
+#[command(version, about)]
+struct Cli {
+    #[arg(short, long, value_name = "IP", required = true, num_args = 1..)]
+    whitelist: Vec<IpAddr>,
+}
+
 #[derive(Clone)]
 struct AppState {
     pw_source: PwSource,
     tx: crossbeam::channel::Sender<Vec<u8>>,
     rx: crossbeam::channel::Receiver<Vec<u8>>,
+    whitelist: Vec<IpAddr>,
 }
 
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
+    let cli = Cli::parse();
+
+    if cli.whitelist.is_empty() {
+        error!("Error: whitelist is empty. Specify at least one IP with --whitelist.");
+        std::process::exit(1);
+    }
+
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
@@ -59,13 +79,20 @@ async fn main() -> eyre::Result<()> {
         pw_source: PwSource::default(),
         tx,
         rx,
+        whitelist: cli.whitelist,
     };
+
+    let shared_state = Arc::new(app_state);
 
     let app = Router::new()
         .route("/ws", get(ws_handler))
         .route("/health", get(health))
         .fallback_service(ServeDir::new("static"))
-        .with_state(Arc::new(app_state))
+        .layer(middleware::from_fn_with_state(
+            shared_state.clone(),
+            whitelist_middleware,
+        ))
+        .with_state(shared_state)
         .layer(
             TraceLayer::new_for_http().make_span_with(|request: &Request<_>| {
                 let matched_path = request.extensions().get::<MatchedPath>().map(MatchedPath::as_str);
@@ -76,13 +103,34 @@ async fn main() -> eyre::Result<()> {
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await?;
     tracing::info!("Listening on {}", listener.local_addr()?);
-    axum::serve(listener, app).await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
 
     Ok(())
 }
 
 async fn health() -> &'static str {
     "OK"
+}
+
+async fn whitelist_middleware(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<Arc<AppState>>,
+    request: Request<axum::body::Body>,
+    next: Next,
+) -> impl IntoResponse {
+    if !state.whitelist.contains(&addr.ip()) {
+        error!(
+            "Rejected connection from {} on {}",
+            addr.ip(),
+            request.uri()
+        );
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    next.run(request).await.into_response()
 }
 
 async fn ws_handler(ws: WebSocketUpgrade, State(state): State<Arc<AppState>>) -> impl IntoResponse {

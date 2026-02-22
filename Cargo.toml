@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 ashpd = { version = "0.12", features = ["tracing"] }
 axum = { version = "0.8", features = ["ws"] }
+clap = { version = "4.5", features = ["derive"] }
 crossbeam = "0.8"
 eyre = "0.6"
 pipewire = "0.9"
