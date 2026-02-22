@@ -1,5 +1,5 @@
 use std::{
-    io::Cursor,
+    io::{Cursor, Read},
     os::fd::OwnedFd,
     sync::{Arc, Mutex},
 };
@@ -148,40 +148,14 @@ impl PwSource {
                     let size = user_data.format.size();
                     let framerate = user_data.format.framerate();
 
-                    match FfmpegEncoder::new(
+                    PwSource::setup_encoder(
                         size.width,
                         size.height,
                         framerate.num,
                         framerate.denom,
                         format,
-                    ) {
-                        Ok((encoder, mut stdout)) => {
-                            info!("FFmpeg encoder started successfully");
-                            user_data.encoder = Some(Arc::new(Mutex::new(encoder)));
-
-                            let tx = user_data.tx.clone();
-                            std::thread::spawn(move || {
-                                use std::io::Read;
-                                let mut buffer = [0u8; 65536];
-                                loop {
-                                    match stdout.read(&mut buffer) {
-                                        Ok(0) => break,
-                                        Ok(n) => {
-                                            if let Err(e) = tx.send(buffer[..n].to_vec()) {
-                                                error!("Failed to send encoded data: {:?}", e);
-                                                break;
-                                            }
-                                        }
-                                        Err(e) => {
-                                            error!("Failed to read from FFmpeg encoder: {:?}", e);
-                                            break;
-                                        }
-                                    }
-                                }
-                            });
-                        }
-                        Err(e) => error!("Failed to start FFmpeg encoder: {:?}", e),
-                    }
+                        user_data,
+                    );
                 }
             })
             .process(|stream, user_data| match stream.dequeue_buffer() {
@@ -312,5 +286,80 @@ impl PwSource {
 
     pub fn is_initialized(&self) -> bool {
         self.is_initialized
+    }
+
+    fn setup_encoder(
+        width: u32,
+        height: u32,
+        framerate_num: u32,
+        framerate_denom: u32,
+        format: VideoFormat,
+        user_data: &mut UserData,
+    ) {
+        match FfmpegEncoder::new(width, height, framerate_num, framerate_denom, format) {
+            Ok((encoder, mut stdout)) => {
+                info!("FFmpeg encoder started successfully");
+                user_data.encoder = Some(Arc::new(Mutex::new(encoder)));
+
+                let tx = user_data.tx.clone();
+                std::thread::spawn(move || {
+                    let mut read_buf = [0u8; 65536];
+                    let mut accumulator: Vec<u8> = Vec::new();
+
+                    loop {
+                        match stdout.read(&mut read_buf) {
+                            Ok(0) => {
+                                if !accumulator.is_empty() {
+                                    let _ = tx.send(accumulator);
+                                }
+                                break;
+                            }
+                            Ok(n) => {
+                                accumulator.extend_from_slice(&read_buf[..n]);
+
+                                // Extract complete NAL units delimited by
+                                // Annex B start codes (00 00 00 01).
+                                // Only send data once a *second* start code is
+                                // found, guaranteeing the previous NAL unit is
+                                // complete.
+                                let mut search_pos = 0;
+                                while let Some(start) =
+                                    Self::find_start_code(&accumulator, search_pos)
+                                {
+                                    match Self::find_start_code(&accumulator, start + 4) {
+                                        Some(next) => {
+                                            let nal = accumulator[start..next].to_vec();
+                                            if let Err(e) = tx.send(nal) {
+                                                error!("Failed to send encoded data: {:?}", e);
+                                                return;
+                                            }
+                                            search_pos = next;
+                                        }
+                                        None => break, // wait for more data
+                                    }
+                                }
+
+                                if search_pos > 0 {
+                                    accumulator = accumulator[search_pos..].to_vec();
+                                }
+                            }
+                            Err(e) => {
+                                error!("Failed to read from FFmpeg encoder: {:?}", e);
+                                break;
+                            }
+                        }
+                    }
+                });
+            }
+            Err(e) => error!("Failed to start FFmpeg encoder: {:?}", e),
+        }
+    }
+
+    fn find_start_code(data: &[u8], start: usize) -> Option<usize> {
+        if data.len() < start + 4 {
+            return None;
+        }
+        (start..data.len() - 3)
+            .find(|&i| data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 0 && data[i + 3] == 1)
     }
 }
