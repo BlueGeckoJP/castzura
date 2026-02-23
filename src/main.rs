@@ -14,15 +14,16 @@ use crate::pw_source::PwSource;
 use axum::{
     Router,
     extract::{
-        ConnectInfo, MatchedPath, State, WebSocketUpgrade,
+        ConnectInfo, Form, MatchedPath, State, WebSocketUpgrade,
         ws::{Message, WebSocket},
     },
     http::{Request, StatusCode},
     middleware::{self, Next},
     response::Html,
-    response::IntoResponse,
-    routing::get,
+    response::{IntoResponse, Redirect},
+    routing::{get, post},
 };
+use serde::Deserialize;
 use clap::Parser;
 use std::time::Instant;
 use tower_http::{services::ServeDir, trace::TraceLayer};
@@ -96,6 +97,11 @@ struct Cli {
     whitelist: Vec<IpAddr>,
 }
 
+#[derive(Deserialize)]
+struct DisconnectForm {
+    ip: String,
+}
+
 #[derive(Clone)]
 struct AppState {
     pw_source: PwSource,
@@ -103,6 +109,7 @@ struct AppState {
     rx: crossbeam::channel::Receiver<Vec<u8>>,
     whitelist: Vec<IpAddr>,
     connected_clients: Arc<Mutex<HashSet<IpAddr>>>,
+    disconnect_requests: Arc<Mutex<HashSet<IpAddr>>>,
     ffmpeg_running: Arc<AtomicBool>,
     pw_running: Arc<AtomicBool>,
     log_buffer: Arc<Mutex<VecDeque<String>>>,
@@ -143,6 +150,7 @@ async fn main() -> eyre::Result<()> {
         rx,
         whitelist: cli.whitelist,
         connected_clients: Arc::new(Mutex::new(HashSet::new())),
+        disconnect_requests: Arc::new(Mutex::new(HashSet::new())),
         ffmpeg_running: Arc::new(AtomicBool::new(false)),
         pw_running: Arc::new(AtomicBool::new(false)),
         log_buffer,
@@ -155,6 +163,7 @@ async fn main() -> eyre::Result<()> {
         .route("/health", get(health_handler))
         .route("/status", get(status_handler))
         .route("/status/raw", get(status_raw_handler))
+        .route("/disconnect", post(disconnect_handler))
         .fallback_service(ServeDir::new("static"))
         .layer(middleware::from_fn_with_state(
             shared_state.clone(),
@@ -222,7 +231,9 @@ async fn status_handler(
     } else {
         clients
             .iter()
-            .map(|ip| format!("<li>{ip}</li>"))
+            .map(|ip| format!(
+                "<li>{ip}<form method=\"post\" action=\"/disconnect\" style=\"display:inline;margin:0\"><input type=\"hidden\" name=\"ip\" value=\"{ip}\"><button type=\"submit\" class=\"disconnect-btn\">disconnect</button></form></li>"
+            ))
             .collect::<Vec<_>>()
             .join("\n")
     };
@@ -242,6 +253,21 @@ async fn status_handler(
         .replace("{{log_rows}}", &log_rows);
 
     Html(html).into_response()
+}
+
+async fn disconnect_handler(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<Arc<AppState>>,
+    Form(form): Form<DisconnectForm>,
+) -> impl IntoResponse {
+    if !addr.ip().is_loopback() {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    if let Ok(ip) = form.ip.parse::<IpAddr>() {
+        state.disconnect_requests.lock().unwrap().insert(ip);
+        info!("Disconnect requested for: {}", ip);
+    }
+    Redirect::to("/status").into_response()
 }
 
 fn html_escape(s: &str) -> String {
@@ -386,6 +412,10 @@ async fn handle_websocket(mut socket: WebSocket, state: Arc<AppState>, client_ip
         let mut last_rtp_ts: u32 = 0;
 
         while let Ok(data) = state.rx.recv() {
+            if state.disconnect_requests.lock().unwrap().remove(&client_ip) {
+                info!("Disconnecting client by request: {}", client_ip);
+                break;
+            }
             // Calculate RTP timestamp increment based on real elapsed time (90kHz clock)
             let now_ts = (start.elapsed().as_secs_f64() * 90000.0) as u32;
             let samples = now_ts.wrapping_sub(last_rtp_ts).max(1);
