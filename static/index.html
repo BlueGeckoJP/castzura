@@ -1,14 +1,57 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>castzura</title>
+    <style>
+        *,
+        *::before,
+        *::after {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        html,
+        body {
+            width: 100%;
+            height: 100%;
+            background: #000;
+            overflow: hidden;
+        }
+
+        #remote-video {
+            display: block;
+            width: 100%;
+            height: 100%;
+            object-fit: contain;
+        }
+
+        #status {
+            position: fixed;
+            bottom: 12px;
+            right: 16px;
+            font: 11px/1 monospace;
+            color: rgba(255, 255, 255, 0.3);
+            pointer-events: none;
+            user-select: none;
+        }
+    </style>
+</head>
 
 <body>
-    <video id="remoteVideo" autoplay playsinline controls style="width: 500px;"></video>
+    <video id="remote-video" autoplay playsinline controls></video>
+    <div id="status">connecting…</div>
     <script>
         const peerConn = new RTCPeerConnection();
         const ws = new WebSocket(`ws://${location.host}/ws`);
+        const status = document.getElementById("status");
 
         peerConn.ontrack = (event) => {
-            document.getElementById("remoteVideo").srcObject = event.streams[0];
+            document.getElementById("remote-video").srcObject = event.streams[0];
+            status.textContent = "";
         }
 
         ws.onopen = async () => {
@@ -25,6 +68,8 @@
             const answer = JSON.parse(event.data);
             await peerConn.setRemoteDescription(answer);
         }
+
+        ws.onclose = () => { status.textContent = "disconnected"; }
     </script>
 </body>
 
