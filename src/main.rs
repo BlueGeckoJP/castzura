@@ -2,8 +2,12 @@ mod ffmpeg_encoder;
 mod pw_source;
 
 use std::{
+    collections::{HashSet, VecDeque},
     net::{IpAddr, SocketAddr},
-    sync::Arc,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use crate::pw_source::PwSource;
@@ -15,6 +19,7 @@ use axum::{
     },
     http::{Request, StatusCode},
     middleware::{self, Next},
+    response::Html,
     response::IntoResponse,
     routing::get,
 };
@@ -22,7 +27,7 @@ use clap::Parser;
 use std::time::Instant;
 use tower_http::{services::ServeDir, trace::TraceLayer};
 use tracing::{error, info, info_span};
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+use tracing_subscriber::{Layer, layer::SubscriberExt, util::SubscriberInitExt};
 use webrtc::{
     api::{APIBuilder, media_engine::MediaEngine},
     peer_connection::{
@@ -35,6 +40,54 @@ use webrtc::{
     rtp_transceiver::rtp_codec::RTCRtpCodecCapability,
     track::track_local::{TrackLocalWriter, track_local_static_rtp::TrackLocalStaticRTP},
 };
+
+// --- Log buffer layer ---
+
+#[derive(Default)]
+struct MessageVisitor {
+    message: String,
+}
+
+impl tracing::field::Visit for MessageVisitor {
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        if field.name() == "message" {
+            self.message = value.to_string();
+        }
+    }
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "message" {
+            self.message = format!("{:?}", value);
+        }
+    }
+}
+
+struct LogBufferLayer {
+    buffer: Arc<Mutex<VecDeque<String>>>,
+}
+
+impl<S: tracing::Subscriber> Layer<S> for LogBufferLayer {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        let mut visitor = MessageVisitor::default();
+        event.record(&mut visitor);
+        let line = format!(
+            "[{}] {}: {}",
+            event.metadata().target(),
+            event.metadata().level(),
+            visitor.message
+        );
+        let mut buf = self.buffer.lock().unwrap();
+        if buf.len() >= 200 {
+            buf.pop_front();
+        }
+        buf.push_back(line);
+    }
+}
+
+// --- CLI / AppState ---
 
 #[derive(Parser)]
 #[command(version, about)]
@@ -49,6 +102,10 @@ struct AppState {
     tx: crossbeam::channel::Sender<Vec<u8>>,
     rx: crossbeam::channel::Receiver<Vec<u8>>,
     whitelist: Vec<IpAddr>,
+    connected_clients: Arc<Mutex<HashSet<IpAddr>>>,
+    ffmpeg_running: Arc<AtomicBool>,
+    pw_running: Arc<AtomicBool>,
+    log_buffer: Arc<Mutex<VecDeque<String>>>,
 }
 
 #[tokio::main]
@@ -59,6 +116,8 @@ async fn main() -> eyre::Result<()> {
         error!("Error: whitelist is empty. Specify at least one IP with --whitelist.");
         std::process::exit(1);
     }
+
+    let log_buffer: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::new()));
 
     tracing_subscriber::registry()
         .with(
@@ -71,6 +130,9 @@ async fn main() -> eyre::Result<()> {
             }),
         )
         .with(tracing_subscriber::fmt::layer())
+        .with(LogBufferLayer {
+            buffer: log_buffer.clone(),
+        })
         .init();
 
     let (tx, rx) = crossbeam::channel::unbounded();
@@ -80,6 +142,10 @@ async fn main() -> eyre::Result<()> {
         tx,
         rx,
         whitelist: cli.whitelist,
+        connected_clients: Arc::new(Mutex::new(HashSet::new())),
+        ffmpeg_running: Arc::new(AtomicBool::new(false)),
+        pw_running: Arc::new(AtomicBool::new(false)),
+        log_buffer,
     };
 
     let shared_state = Arc::new(app_state);
@@ -87,6 +153,8 @@ async fn main() -> eyre::Result<()> {
     let app = Router::new()
         .route("/ws", get(ws_handler))
         .route("/health", get(health_handler))
+        .route("/status", get(status_handler))
+        .route("/status/raw", get(status_raw_handler))
         .fallback_service(ServeDir::new("static"))
         .layer(middleware::from_fn_with_state(
             shared_state.clone(),
@@ -116,6 +184,102 @@ async fn health_handler() -> &'static str {
     "OK"
 }
 
+fn bool_label(v: bool) -> &'static str {
+    if v { "yes" } else { "no" }
+}
+
+async fn status_handler(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    if !addr.ip().is_loopback() {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+
+    let clients: Vec<String> = state
+        .connected_clients
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|ip| ip.to_string())
+        .collect();
+
+    let whitelist: Vec<String> = state.whitelist.iter().map(|ip| ip.to_string()).collect();
+
+    let logs: Vec<String> = state.log_buffer.lock().unwrap().iter().cloned().collect();
+
+    let ffmpeg = bool_label(state.ffmpeg_running.load(Ordering::Relaxed));
+    let pw = bool_label(state.pw_running.load(Ordering::Relaxed));
+
+    let whitelist_rows = whitelist
+        .iter()
+        .map(|ip| format!("<li>{ip}</li>"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let client_rows = if clients.is_empty() {
+        "<li><em>none</em></li>".to_string()
+    } else {
+        clients
+            .iter()
+            .map(|ip| format!("<li>{ip}</li>"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    let log_rows = logs
+        .iter()
+        .rev()
+        .map(|l| format!("<div>{}</div>", html_escape(l)))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let html = include_str!("../templates/status.html")
+        .replace("{{ffmpeg}}", ffmpeg)
+        .replace("{{pw}}", pw)
+        .replace("{{whitelist_rows}}", &whitelist_rows)
+        .replace("{{client_rows}}", &client_rows)
+        .replace("{{log_rows}}", &log_rows);
+
+    Html(html).into_response()
+}
+
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+async fn status_raw_handler(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    if !addr.ip().is_loopback() {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+
+    let clients: Vec<String> = state
+        .connected_clients
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|ip| ip.to_string())
+        .collect();
+
+    let whitelist: Vec<String> = state.whitelist.iter().map(|ip| ip.to_string()).collect();
+
+    let logs: Vec<String> = state.log_buffer.lock().unwrap().iter().cloned().collect();
+
+    axum::Json(serde_json::json!({
+        "whitelist": whitelist,
+        "connected_clients": clients,
+        "ffmpeg_running": state.ffmpeg_running.load(Ordering::Relaxed),
+        "pw_running": state.pw_running.load(Ordering::Relaxed),
+        "logs": logs,
+    }))
+    .into_response()
+}
+
 async fn whitelist_middleware(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<Arc<AppState>>,
@@ -133,15 +297,21 @@ async fn whitelist_middleware(
     next.run(request).await.into_response()
 }
 
-async fn ws_handler(ws: WebSocketUpgrade, State(state): State<Arc<AppState>>) -> impl IntoResponse {
+async fn ws_handler(
+    ws: WebSocketUpgrade,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
     if !state.pw_source.is_initialized() {
         info!("Initializing PipeWire stream...");
         let (node_id, fd) = PwSource::get_pw_node_id().await.unwrap();
         let mut pw_source = state.pw_source.clone();
-        let state = state.clone();
+        let ffmpeg_running = state.ffmpeg_running.clone();
+        let pw_running = state.pw_running.clone();
+        let tx = state.tx.clone();
         tokio::spawn(async move {
             if let Err(e) = pw_source
-                .start_pw_stream(fd, node_id, state.tx.clone())
+                .start_pw_stream(fd, node_id, tx, ffmpeg_running, pw_running)
                 .await
             {
                 error!("Error in PipeWire stream: {:?}", e);
@@ -149,10 +319,13 @@ async fn ws_handler(ws: WebSocketUpgrade, State(state): State<Arc<AppState>>) ->
         });
     }
 
-    ws.on_upgrade(|socket| handle_websocket(socket, state))
+    let client_ip = addr.ip();
+    ws.on_upgrade(move |socket| handle_websocket(socket, state, client_ip))
 }
 
-async fn handle_websocket(mut socket: WebSocket, state: Arc<AppState>) {
+async fn handle_websocket(mut socket: WebSocket, state: Arc<AppState>, client_ip: IpAddr) {
+    state.connected_clients.lock().unwrap().insert(client_ip);
+    info!("WebSocket client connected: {}", client_ip);
     let mut m = MediaEngine::default();
     m.register_default_codecs().unwrap();
 
@@ -225,4 +398,7 @@ async fn handle_websocket(mut socket: WebSocket, state: Arc<AppState>) {
             }
         }
     }
+
+    state.connected_clients.lock().unwrap().remove(&client_ip);
+    info!("WebSocket client disconnected: {}", client_ip);
 }

@@ -1,7 +1,10 @@
 use std::{
     io::{Cursor, Read},
     os::fd::OwnedFd,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use ashpd::desktop::{
@@ -31,6 +34,7 @@ struct UserData {
     format: VideoInfoRaw,
     encoder: Option<Arc<Mutex<FfmpegEncoder>>>,
     tx: crossbeam::channel::Sender<Vec<u8>>,
+    ffmpeg_running: Arc<AtomicBool>,
 }
 
 #[derive(Default, Clone)]
@@ -71,6 +75,8 @@ impl PwSource {
         fd: OwnedFd,
         node_id: u32,
         tx: crossbeam::channel::Sender<Vec<u8>>,
+        ffmpeg_running: Arc<AtomicBool>,
+        pw_running: Arc<AtomicBool>,
     ) -> eyre::Result<()> {
         pipewire::init();
 
@@ -82,6 +88,7 @@ impl PwSource {
             format: Default::default(),
             encoder: None,
             tx,
+            ffmpeg_running,
         };
 
         let stream = StreamBox::new(
@@ -266,6 +273,7 @@ impl PwSource {
         info!("Connected stream to node_id: {}", node_id);
 
         self.is_initialized = true;
+        pw_running.store(true, Ordering::Relaxed);
 
         mainloop.run();
 
@@ -300,6 +308,7 @@ impl PwSource {
             Ok((encoder, mut stdout)) => {
                 info!("FFmpeg encoder started successfully");
                 user_data.encoder = Some(Arc::new(Mutex::new(encoder)));
+                user_data.ffmpeg_running.store(true, Ordering::Relaxed);
 
                 let tx = user_data.tx.clone();
                 std::thread::spawn(move || {
