@@ -23,8 +23,8 @@ use axum::{
     response::{IntoResponse, Redirect},
     routing::{get, post},
 };
-use serde::Deserialize;
 use clap::Parser;
+use serde::Deserialize;
 use std::time::Instant;
 use tower_http::{services::ServeDir, trace::TraceLayer};
 use tracing::{error, info, info_span};
@@ -105,8 +105,7 @@ struct DisconnectForm {
 #[derive(Clone)]
 struct AppState {
     pw_source: PwSource,
-    tx: crossbeam::channel::Sender<Vec<u8>>,
-    rx: crossbeam::channel::Receiver<Vec<u8>>,
+    tx: tokio::sync::broadcast::Sender<Vec<u8>>,
     whitelist: Vec<IpAddr>,
     connected_clients: Arc<Mutex<HashSet<IpAddr>>>,
     disconnect_requests: Arc<Mutex<HashSet<IpAddr>>>,
@@ -142,12 +141,11 @@ async fn main() -> eyre::Result<()> {
         })
         .init();
 
-    let (tx, rx) = crossbeam::channel::unbounded();
+    let (tx, _) = tokio::sync::broadcast::channel(512);
 
     let app_state = AppState {
-        pw_source: PwSource::default(),
+        pw_source: PwSource,
         tx,
-        rx,
         whitelist: cli.whitelist,
         connected_clients: Arc::new(Mutex::new(HashSet::new())),
         disconnect_requests: Arc::new(Mutex::new(HashSet::new())),
@@ -328,7 +326,11 @@ async fn ws_handler(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
-    if !state.pw_source.is_initialized() {
+    if state
+        .pw_running
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok()
+    {
         info!("Initializing PipeWire stream...");
         let (node_id, fd) = PwSource::get_pw_node_id().await.unwrap();
         let mut pw_source = state.pw_source.clone();
@@ -337,12 +339,15 @@ async fn ws_handler(
         let tx = state.tx.clone();
         tokio::spawn(async move {
             if let Err(e) = pw_source
-                .start_pw_stream(fd, node_id, tx, ffmpeg_running, pw_running)
+                .start_pw_stream(fd, node_id, tx, ffmpeg_running, pw_running.clone())
                 .await
             {
                 error!("Error in PipeWire stream: {:?}", e);
+                pw_running.store(false, Ordering::SeqCst);
             }
         });
+    } else {
+        info!("PipeWire stream is already running, skipping initialization");
     }
 
     let client_ip = addr.ip();
@@ -352,6 +357,8 @@ async fn ws_handler(
 async fn handle_websocket(mut socket: WebSocket, state: Arc<AppState>, client_ip: IpAddr) {
     state.connected_clients.lock().unwrap().insert(client_ip);
     info!("WebSocket client connected: {}", client_ip);
+    // Subscribe before WebRTC handshake so no frames are missed
+    let mut rx = state.tx.subscribe();
     let mut m = MediaEngine::default();
     m.register_default_codecs().unwrap();
 
@@ -411,7 +418,16 @@ async fn handle_websocket(mut socket: WebSocket, state: Arc<AppState>, client_ip
         let start = Instant::now();
         let mut last_rtp_ts: u32 = 0;
 
-        while let Ok(data) = state.rx.recv() {
+        loop {
+            let data = match rx.recv().await {
+                Ok(d) => d,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    tracing::warn!("Video receiver lagged by {} frames, skipping", n);
+                    continue;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            };
+
             if state.disconnect_requests.lock().unwrap().remove(&client_ip) {
                 info!("Disconnecting client by request: {}", client_ip);
                 break;

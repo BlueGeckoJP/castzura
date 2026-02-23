@@ -33,14 +33,12 @@ use crate::ffmpeg_encoder::FfmpegEncoder;
 struct UserData {
     format: VideoInfoRaw,
     encoder: Option<Arc<Mutex<FfmpegEncoder>>>,
-    tx: crossbeam::channel::Sender<Vec<u8>>,
+    tx: tokio::sync::broadcast::Sender<Vec<u8>>,
     ffmpeg_running: Arc<AtomicBool>,
 }
 
-#[derive(Default, Clone)]
-pub struct PwSource {
-    is_initialized: bool,
-}
+#[derive(Clone)]
+pub struct PwSource;
 
 impl PwSource {
     pub async fn get_pw_node_id() -> eyre::Result<(u32, OwnedFd)> {
@@ -74,7 +72,7 @@ impl PwSource {
         &mut self,
         fd: OwnedFd,
         node_id: u32,
-        tx: crossbeam::channel::Sender<Vec<u8>>,
+        tx: tokio::sync::broadcast::Sender<Vec<u8>>,
         ffmpeg_running: Arc<AtomicBool>,
         pw_running: Arc<AtomicBool>,
     ) -> eyre::Result<()> {
@@ -88,7 +86,7 @@ impl PwSource {
             format: Default::default(),
             encoder: None,
             tx,
-            ffmpeg_running,
+            ffmpeg_running: ffmpeg_running.clone(),
         };
 
         let stream = StreamBox::new(
@@ -272,10 +270,13 @@ impl PwSource {
 
         info!("Connected stream to node_id: {}", node_id);
 
-        self.is_initialized = true;
-        pw_running.store(true, Ordering::Relaxed);
+        // pw_running was already set to true in ws_handler via compare_exchange
 
         mainloop.run();
+
+        // mainloop exited: reset flags so the session can be restarted
+        pw_running.store(false, Ordering::SeqCst);
+        ffmpeg_running.store(false, Ordering::SeqCst);
 
         Ok(())
     }
@@ -290,10 +291,6 @@ impl PwSource {
             VideoFormat::I420 => "yuv420p",
             _ => "yuv420p", // Default to a common format
         }
-    }
-
-    pub fn is_initialized(&self) -> bool {
-        self.is_initialized
     }
 
     fn setup_encoder(
@@ -339,8 +336,8 @@ impl PwSource {
                                         Some(next) => {
                                             let nal = accumulator[start..next].to_vec();
                                             if let Err(e) = tx.send(nal) {
-                                                error!("Failed to send encoded data: {:?}", e);
-                                                return;
+                                                // No active receivers - keep running, clients may reconnect
+                                                let _ = e;
                                             }
                                             search_pos = next;
                                         }
