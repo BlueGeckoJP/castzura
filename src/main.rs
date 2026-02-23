@@ -86,7 +86,7 @@ async fn main() -> eyre::Result<()> {
 
     let app = Router::new()
         .route("/ws", get(ws_handler))
-        .route("/health", get(health))
+        .route("/health", get(health_handler))
         .fallback_service(ServeDir::new("static"))
         .layer(middleware::from_fn_with_state(
             shared_state.clone(),
@@ -112,7 +112,7 @@ async fn main() -> eyre::Result<()> {
     Ok(())
 }
 
-async fn health() -> &'static str {
+async fn health_handler() -> &'static str {
     "OK"
 }
 
