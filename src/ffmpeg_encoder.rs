@@ -4,12 +4,25 @@ use std::{
 };
 
 use pipewire::spa::param::video::VideoFormat;
+use tracing::{error, info};
 
 use crate::pw_source::PwSource;
 
 pub struct FfmpegEncoder {
     stdin: ChildStdin,
-    _child: Child,
+    child: Child,
+}
+
+impl Drop for FfmpegEncoder {
+    fn drop(&mut self) {
+        if let Err(e) = self.child.kill() {
+            error!("Failed to kill ffmpeg process: {}", e);
+        }
+        if let Err(e) = self.child.wait() {
+            error!("Failed to wait for ffmpeg process: {}", e);
+        }
+        info!("Successfully killed ffmpeg process");
+    }
 }
 
 impl FfmpegEncoder {
@@ -72,13 +85,7 @@ impl FfmpegEncoder {
         let stdin = child.stdin.take().expect("Failed to open ffmpeg stdin");
         let stdout = child.stdout.take().expect("Failed to open ffmpeg stdout");
 
-        Ok((
-            Self {
-                stdin,
-                _child: child,
-            },
-            stdout,
-        ))
+        Ok((Self { stdin, child }, stdout))
     }
 
     pub fn write_frame(&mut self, data: &[u8]) -> eyre::Result<()> {
