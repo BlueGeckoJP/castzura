@@ -1,5 +1,6 @@
 mod ffmpeg_encoder;
 mod pw_source;
+mod routes;
 
 use std::{
     collections::{HashSet, VecDeque},
@@ -10,7 +11,7 @@ use std::{
     },
 };
 
-use crate::pw_source::PwSource;
+use crate::{pw_source::PwSource, routes::status::status_handler};
 use axum::{
     Router,
     extract::{
@@ -19,7 +20,6 @@ use axum::{
     },
     http::{Request, StatusCode},
     middleware::{self, Next},
-    response::Html,
     response::{IntoResponse, Redirect},
     routing::{get, post},
 };
@@ -189,68 +189,6 @@ async fn main() -> eyre::Result<()> {
 
 async fn health_handler() -> &'static str {
     "OK"
-}
-
-fn bool_label(v: bool) -> &'static str {
-    if v { "yes" } else { "no" }
-}
-
-async fn status_handler(
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    State(state): State<Arc<AppState>>,
-) -> impl IntoResponse {
-    if !addr.ip().is_loopback() {
-        return StatusCode::FORBIDDEN.into_response();
-    }
-
-    let clients: Vec<String> = state
-        .connected_clients
-        .lock()
-        .unwrap()
-        .iter()
-        .map(|ip| ip.to_string())
-        .collect();
-
-    let whitelist: Vec<String> = state.whitelist.iter().map(|ip| ip.to_string()).collect();
-
-    let logs: Vec<String> = state.log_buffer.lock().unwrap().iter().cloned().collect();
-
-    let ffmpeg = bool_label(state.ffmpeg_running.load(Ordering::Relaxed));
-    let pw = bool_label(state.pw_running.load(Ordering::Relaxed));
-
-    let whitelist_rows = whitelist
-        .iter()
-        .map(|ip| format!("<li>{ip}</li>"))
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    let client_rows = if clients.is_empty() {
-        "<li><em>none</em></li>".to_string()
-    } else {
-        clients
-            .iter()
-            .map(|ip| format!(
-                "<li>{ip}<form method=\"post\" action=\"/disconnect\" style=\"display:inline;margin:0\"><input type=\"hidden\" name=\"ip\" value=\"{ip}\"><button type=\"submit\" class=\"disconnect-btn\">disconnect</button></form></li>"
-            ))
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
-
-    let log_rows = logs
-        .iter()
-        .rev()
-        .map(|l| format!("<div>{}</div>", html_escape(l)))
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    let html = include_str!("../templates/status.html")
-        .replace("{{ffmpeg}}", ffmpeg)
-        .replace("{{pw}}", pw)
-        .replace("{{whitelist_rows}}", &whitelist_rows)
-        .replace("{{client_rows}}", &client_rows)
-        .replace("{{log_rows}}", &log_rows);
-
-    Html(html).into_response()
 }
 
 async fn disconnect_handler(
