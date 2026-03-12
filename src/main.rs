@@ -11,16 +11,19 @@ use std::{
     },
 };
 
-use crate::{pw_source::PwSource, routes::status::status_handler};
+use crate::{
+    pw_source::PwSource,
+    routes::{disconnect::disconnect_handler, status::status_handler},
+};
 use axum::{
     Router,
     extract::{
-        ConnectInfo, Form, MatchedPath, State, WebSocketUpgrade,
+        ConnectInfo, MatchedPath, State, WebSocketUpgrade,
         ws::{Message, WebSocket},
     },
     http::{Request, StatusCode},
     middleware::{self, Next},
-    response::{IntoResponse, Redirect},
+    response::IntoResponse,
     routing::{get, post},
 };
 use clap::Parser;
@@ -189,21 +192,6 @@ async fn main() -> eyre::Result<()> {
 
 async fn health_handler() -> &'static str {
     "OK"
-}
-
-async fn disconnect_handler(
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    State(state): State<Arc<AppState>>,
-    Form(form): Form<DisconnectForm>,
-) -> impl IntoResponse {
-    if !addr.ip().is_loopback() {
-        return StatusCode::FORBIDDEN.into_response();
-    }
-    if let Ok(ip) = form.ip.parse::<IpAddr>() {
-        state.disconnect_requests.lock().unwrap().insert(ip);
-        info!("Disconnect requested for: {}", ip);
-    }
-    Redirect::to("/status").into_response()
 }
 
 fn html_escape(s: &str) -> String {
