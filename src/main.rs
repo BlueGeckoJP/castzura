@@ -11,8 +11,7 @@ use std::{
 use crate::{
     pw_source::PwSource,
     routes::{
-        disconnect::disconnect_handler, status::status_handler, status_raw::status_raw_handler,
-        ws::ws_handler,
+        disconnect::disconnect_handler, health::health_handler, status::status_handler, status_raw::status_raw_handler, ws::ws_handler
     },
 };
 use axum::{
@@ -172,10 +171,6 @@ async fn main() -> eyre::Result<()> {
     .await?;
 
     Ok(())
-}
-
-async fn health_handler() -> &'static str {
-    "OK"
 }
 
 fn html_escape(s: &str) -> String {
