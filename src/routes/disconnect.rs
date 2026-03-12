@@ -9,9 +9,15 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Redirect},
 };
+use serde::Deserialize;
 use tracing::info;
 
-use crate::{AppState, DisconnectForm};
+use crate::AppState;
+
+#[derive(Deserialize)]
+pub struct DisconnectForm {
+    ip: String,
+}
 
 pub async fn disconnect_handler(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,

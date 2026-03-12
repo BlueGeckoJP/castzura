@@ -11,7 +11,8 @@ use std::{
 use crate::{
     pw_source::PwSource,
     routes::{
-        disconnect::disconnect_handler, health::health_handler, status::status_handler, status_raw::status_raw_handler, ws::ws_handler
+        disconnect::disconnect_handler, health::health_handler, status::status_handler,
+        status_raw::status_raw_handler, ws::ws_handler,
     },
 };
 use axum::{
@@ -23,7 +24,6 @@ use axum::{
     routing::{get, post},
 };
 use clap::Parser;
-use serde::Deserialize;
 use tower_http::{services::ServeDir, trace::TraceLayer};
 use tracing::{error, info_span};
 use tracing_subscriber::{Layer, layer::SubscriberExt, util::SubscriberInitExt};
@@ -81,11 +81,6 @@ impl<S: tracing::Subscriber> Layer<S> for LogBufferLayer {
 struct Cli {
     #[arg(short, long, value_name = "IP", required = true, num_args = 1..)]
     whitelist: Vec<IpAddr>,
-}
-
-#[derive(Deserialize)]
-struct DisconnectForm {
-    ip: String,
 }
 
 #[derive(Clone)]
